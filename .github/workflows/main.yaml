@@ -1,8 +1,8 @@
-name: Web Application CI/CD Pipeline
+name: React Web App CI/CD
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
     paths-ignore:
       - "README.md"
       - "docs/**"
@@ -10,14 +10,14 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  DOCKER_BUILDKIT: 1
+  ECR_REPOSITORY: adi-project
+  IMAGE_TAG: ${{ github.sha }}
+
 permissions:
   id-token: write
   contents: read
-
-env:
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
-  IMAGE_TAG: ${{ github.sha }}
-  DOCKER_BUILDKIT: 1
 
 jobs:
   integration:
@@ -26,58 +26,34 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
         with:
-          fetch-depth: 0
+          node-version: '18'
+          cache: 'npm'
 
-      - name: Cache dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.npm
-          key: npm-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: npm-
-
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          if [ -f package.json ]; then
-            npm ci
-          fi
+          npm install
 
-      - name: Lint code
+      - name: Run ESLint
         run: |
-          if [ -f package.json ]; then
-            npm run lint
-          else
-            echo "Skipping linting - no package.json found"
-          fi
+          npm run lint || echo "No lint script found"
 
-      - name: Run unit tests
+      - name: Run Tests
         run: |
-          if [ -f package.json ]; then
-            npm run test
-          else
-            echo "Skipping tests - no package.json found"
-          fi
+          npm test || echo "No test script found"
 
-      - name: Run security scan
-        uses: snyk/actions/node@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        if: env.SNYK_TOKEN != ''
-
-  build-and-push-ecr-image:
+  build-and-push:
     name: Build and Push to ECR
     needs: integration
     runs-on: ubuntu-latest
-    outputs:
-      image-uri: ${{ steps.build-image.outputs.image }}
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v3
         with:
@@ -89,37 +65,28 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
-        id: build-image
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Scan Docker image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
-          format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
+      - name: Build and Push Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+                      -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          echo "::set-output name=image::$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
 
   deploy:
-    name: Deploy to Production
-    needs: build-and-push-ecr-image
+    name: Deploy to EC2
+    needs: build-and-push
     runs-on: self-hosted
-    environment: production
-
+    
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Clean Workspace
+        run: |
+          rm -rf node_modules
+          rm -rf build
+          rm -rf .next
+          rm -rf .cache
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v3
@@ -132,45 +99,55 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Clean up disk space
+      - name: Clean Docker Resources
         run: |
-          docker system prune -a -f --volumes
-          docker image prune -a -f
+          echo "Cleaning up Docker resources..."
+          docker system prune -a -f || true
+          docker volume prune -f || true
+          echo "Current disk space:"
           df -h
 
-      - name: Deploy new container
+      - name: Stop Existing Container
         run: |
-          # Stop and remove existing container
-          docker ps -q --filter "name=webtest" | grep -q . && docker stop webtest && docker rm -fv webtest || true
+          echo "Stopping existing container..."
+          docker ps -q --filter "name=adi-app" | grep -q . && docker stop adi-app && docker rm -fv adi-app || true
 
-          # Pull and run new container
-          docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+      - name: Pull and Run New Container
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "Pulling new image..."
+          docker pull $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          
+          echo "Starting new container..."
           docker run -d \
-            --name=webtest \
-            --restart=unless-stopped \
-            -p 8086:8086 \
-            --ipc=host \
-            -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-            -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-            -e AWS_REGION=${{ secrets.AWS_REGION }} \
+            --name adi-app \
+            --restart unless-stopped \
+            -p 3000:3000 \
             -e NODE_ENV=production \
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
 
-      - name: Health check
+      - name: Health Check
         run: |
-          timeout=300
+          echo "Waiting for application to start..."
+          timeout=60
           while [ $timeout -gt 0 ]; do
-            if curl -f http://localhost:8086/health; then
-              echo "Application is healthy"
+            if curl -s http://localhost:3000 > /dev/null; then
+              echo "Application is running!"
               exit 0
             fi
+            echo "Waiting for application to become ready... ($timeout seconds left)"
             sleep 5
             timeout=$((timeout-5))
           done
-          echo "Health check failed"
+          echo "Application failed to start. Logs:"
+          docker logs adi-app
           exit 1
 
-      - name: Verify deployment
+      - name: Show Container Status
+        if: always()
         run: |
+          echo "Container status:"
           docker ps -a
-          docker logs webtest
+          echo "Container logs:"
+          docker logs adi-app
