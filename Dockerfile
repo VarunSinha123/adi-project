@@ -1,11 +1,15 @@
-FROM node:alpine3.10
-
+# Build stage
+FROM node:18-alpine as builder
 WORKDIR /app
-
-COPY . .
-
+COPY package*.json ./
 RUN npm install
+COPY . .
+RUN npm run build
 
-EXPOSE 80
-
-CMD ["node", "app.js"]
+# Production stage
+FROM node:18-alpine
+WORKDIR /app
+COPY --from=builder /app/build ./build
+RUN npm install -g serve
+EXPOSE 3000
+CMD ["serve", "-s", "build", "-l", "3000"]
